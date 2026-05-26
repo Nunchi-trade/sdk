@@ -1,6 +1,14 @@
 # sdk
 The Nunchi SDK for commonware blockchains
 
+## Chains
+
+This repository contains Nunchi, the blockchain.  
+
+
+## Modules
+
+This repository contains modules for building public and private blockchains, as well as sequencer systems / rollups. 
 
 * Coins - defines what a coin is, other basic financial functions
 * Bridge - moves coins between chains
