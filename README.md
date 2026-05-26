@@ -30,7 +30,7 @@ This repository contains modules for building public and private blockchains, as
   * Depends on coins
 * Portfolio Margin - user has BTC + nunchi and doesn't want to sell, and deposits BTC+nunchi and gets a stablecoin.  Could be backed by other coins, not just btc and nunchi. 
   * Depends on coins
-* Memes - wrapper of coins for memes
+* Factory - wrapper of coins for mass issuance 
   * Depends on coins
 * Securities - Non-synthetic perps contracts (delivery of tokenized stock)
   * Depends on oracle and coins
