@@ -15,7 +15,7 @@ This repository contains modules for building public and private blockchains, as
 * Coins - defines what a coin is, other basic financial functions
 * Bridge - moves coins between chains
   * Depends on coins
-* Evm - the only standalone module here. Designed to be 100% conformant. Based on revm.
+Designed to be 100% conformant. Based on revm.
 * Clob - used on the global chain, provides liquidity between local chain tokens
   * Depends on coins
 * Derivatives - ingests a price feed and creates derivatives products
@@ -36,3 +36,8 @@ This repository contains modules for building public and private blockchains, as
   * Depends on coins
 * Securities - Non-synthetic perps contracts (delivery of tokenized stock)
   * Depends on oracle and coins
+
+
+ ### Virtual Machines
+
+* Evm
