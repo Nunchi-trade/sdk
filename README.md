@@ -32,19 +32,14 @@ This repository contains modules for building public and private blockchains, as
 ### Finance
 * Portfolio Margin - user has BTC + nunchi and doesn't want to sell, and deposits BTC+nunchi and gets a stablecoin.  Could be backed by other coins, not just btc and nunchi. 
   * Depends on coins
-
 * Securities - Non-synthetic perps contracts (delivery of tokenized stock)
   * Depends on oracle and coins
-
 * Vaults - a module for running vaults composed of many types of capital, traded by an authorised offchain party
   * Depends on coins
-
 * Clob - used on the global chain, provides liquidity between local chain tokens
   * Depends on coins
- 
 * Derivatives - ingests a price feed and creates derivatives products
   * Depends on oracle and coins
-
 * Stablecoin - a wrapper of coins special for the needs of stablecoins
   * Depends on coins
 
