@@ -1,7 +1,7 @@
 # sdk
 The Nunchi SDK for commonware blockchains is an easy to use, modular blockchain framework that centers around a singular definition of what a coin is and how bridging should work.  
 
-By adopting rbe Nunchi SDK for your project, you adopt tbe coin definiton and bridging stule, but arent forced to adopt anything else.  The Nunchi SDK is designed around the specific needs of specalized, localized, high speed decentralized finance.  
+By adopting the Nunchi SDK for your project, you adopt tbe coin definiton and bridging stule, but arent forced to adopt anything else.  The Nunchi SDK is designed around the specific needs of specalized, localized, high speed decentralized finance.  
 
 ## Chains
 
