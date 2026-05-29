@@ -29,6 +29,12 @@ This repository contains modules for building public and private blockchains, as
 * POS - provides a proof of stake security setup for a chain
   * Depends on coins
 
+### Agents
+
+* Agent Reputation - tracks agent reputation so module participation can be reputation-gated and epoch-rotated.  Identity is a key pair.
+* Marketplace - agents post, discover, claim, and settle jobs (for example, compute ISFR for an epoch).  Pays in coins, updates reputation.
+  * Depends on coins and agent reputation
+
 ### Finance
 * Portfolio Margin - user has BTC + nunchi and doesn't want to sell, and deposits BTC+nunchi and gets a stablecoin.  Could be backed by other coins, not just btc and nunchi. 
   * Depends on coins
@@ -40,6 +46,8 @@ This repository contains modules for building public and private blockchains, as
   * Depends on coins
 * Derivatives - ingests a price feed and creates derivatives products
   * Depends on oracle and coins
+* ISFR - a canonical interest rate index computed on-chain by a rotating, reputation-gated set of agents, then published through oracle
+  * Depends on oracle, coins, agent reputation, and marketplace
 * Stablecoin - a wrapper of coins special for the needs of stablecoins
   * Depends on coins
 
