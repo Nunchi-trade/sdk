@@ -1,0 +1,13 @@
+[package]
+name = "nunchi-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The Nunchi SDK for Commonware blockchains."
+
+[dependencies]
+bytes = "1.7.1"
+commonware-codec = "2026.5.0"
+commonware-consensus = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+thiserror = "2.0.12"
