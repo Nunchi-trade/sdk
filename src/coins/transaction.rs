@@ -1,6 +1,6 @@
-use super::{AccountId, CoinId, CoinSpec, PrivateKey, Signature, COINS_NAMESPACE};
-use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write};
-use commonware_cryptography::{sha256::Digest, Hasher, Sha256, Signer, Verifier};
+use super::{AccountId, CoinId, CoinSpec, Signature, COINS_NAMESPACE};
+use crate::transaction::{SignedTransaction, TransactionOperation};
+use commonware_codec::{EncodeSize, Error, Read, ReadExt, Write};
 
 const OP_CREATE_TOKEN: u8 = 0;
 const OP_MINT: u8 = 1;
@@ -115,94 +115,12 @@ impl EncodeSize for CoinOperation {
     }
 }
 
-/// Signable transaction payload. The nonce is scoped to the signer account.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransactionPayload {
-    pub nonce: u64,
-    pub operation: CoinOperation,
+impl TransactionOperation for CoinOperation {
+    const NAMESPACE: &'static [u8] = COINS_NAMESPACE;
 }
 
-impl TransactionPayload {
-    pub fn new(nonce: u64, operation: CoinOperation) -> Self {
-        Self { nonce, operation }
-    }
-}
-
-impl Write for TransactionPayload {
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.nonce.write(buf);
-        self.operation.write(buf);
-    }
-}
-
-impl Read for TransactionPayload {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl bytes::Buf, _: &Self::Cfg) -> Result<Self, Error> {
-        Ok(Self {
-            nonce: u64::read(buf)?,
-            operation: CoinOperation::read(buf)?,
-        })
-    }
-}
-
-impl EncodeSize for TransactionPayload {
-    fn encode_size(&self) -> usize {
-        self.nonce.encode_size() + self.operation.encode_size()
-    }
-}
+/// Signable coin transaction payload.
+pub type TransactionPayload = crate::transaction::TransactionPayload<CoinOperation>;
 
 /// A signed coin transaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Transaction {
-    pub signer: AccountId,
-    pub payload: TransactionPayload,
-    pub signature: Signature,
-}
-
-impl Transaction {
-    pub fn sign(signer: &PrivateKey, nonce: u64, operation: CoinOperation) -> Self {
-        let payload = TransactionPayload::new(nonce, operation);
-        let signature = signer.sign(COINS_NAMESPACE, &payload.encode());
-        Self {
-            signer: signer.public_key(),
-            payload,
-            signature,
-        }
-    }
-
-    pub fn verify(&self) -> bool {
-        self.signer
-            .verify(COINS_NAMESPACE, &self.payload.encode(), &self.signature)
-    }
-
-    pub fn digest(&self) -> Digest {
-        Sha256::hash(&self.encode())
-    }
-}
-
-impl Write for Transaction {
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.signer.write(buf);
-        self.payload.write(buf);
-        self.signature.write(buf);
-    }
-}
-
-impl Read for Transaction {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl bytes::Buf, _: &Self::Cfg) -> Result<Self, Error> {
-        Ok(Self {
-            signer: AccountId::read(buf)?,
-            payload: TransactionPayload::read(buf)?,
-            signature: Signature::read(buf)?,
-        })
-    }
-}
-
-impl EncodeSize for Transaction {
-    fn encode_size(&self) -> usize {
-        self.signer.encode_size() + self.payload.encode_size() + self.signature.encode_size()
-    }
-}
+pub type Transaction = SignedTransaction<AccountId, Signature, CoinOperation>;
