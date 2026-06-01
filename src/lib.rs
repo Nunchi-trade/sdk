@@ -5,5 +5,6 @@
 
 pub mod blockchain;
 pub mod coins;
+pub mod coinschain;
 
 pub use blockchain::{Block, Chain, ChainError};

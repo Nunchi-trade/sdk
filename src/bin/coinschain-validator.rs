@@ -1,0 +1,340 @@
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use clap::Parser;
+use commonware_codec::{Decode, DecodeExt};
+use commonware_consensus::{marshal, types::ViewDelta};
+use commonware_cryptography::{
+    bls12381::primitives::{
+        group,
+        sharing::{ModeVersion, Sharing},
+        variant::MinSig,
+    },
+    ed25519::{PrivateKey, PublicKey},
+    Signer,
+};
+use commonware_formatting::from_hex;
+use commonware_p2p::{authenticated::discovery as authenticated, Ingress, Manager};
+use commonware_runtime::{tokio as cw_tokio, Runner, Supervisor as _, ThreadPooler};
+use commonware_utils::{ordered::Set, union_unique, NZUsize, NZU32};
+use futures::future::try_join_all;
+use governor::Quota;
+use nunchi_sdk::{
+    coins::Transaction,
+    coinschain::{engine, Config, Mempool, Peers, SharedState, EPOCH, NAMESPACE},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroU32,
+    path::PathBuf,
+    str::FromStr,
+    time::Duration,
+};
+use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
+use tracing::{error, info, Level};
+
+const PENDING_CHANNEL: u64 = 0;
+const RECOVERED_CHANNEL: u64 = 1;
+const RESOLVER_CHANNEL: u64 = 2;
+const BROADCASTER_CHANNEL: u64 = 3;
+const MARSHAL_CHANNEL: u64 = 4;
+
+const LEADER_TIMEOUT: Duration = Duration::from_secs(1);
+const CERTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
+const NULLIFY_RETRY: Duration = Duration::from_secs(10);
+const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
+const SKIP_TIMEOUT: ViewDelta = ViewDelta::new(32);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+const FETCH_CONCURRENT: usize = 4;
+const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+const MESSAGE_RATE_PER_PEER: u32 = 128;
+const BROADCAST_RATE_PER_PEER: u32 = 16;
+const MARSHAL_RATE_PER_PEER: u32 = 16;
+const BLOCKS_FREEZER_TABLE_INITIAL_SIZE: u32 = 2u32.pow(18);
+const FINALIZED_FREEZER_TABLE_INITIAL_SIZE: u32 = 2u32.pow(18);
+
+#[derive(Debug, Parser)]
+struct Args {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    peers: PathBuf,
+}
+
+#[derive(Clone)]
+struct RpcState {
+    public_key: PublicKey,
+    mempool: Mempool,
+    chain: SharedState,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitTransaction {
+    transaction: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitTransactionResponse {
+    accepted: bool,
+    digest: String,
+    mempool_len: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusResponse {
+    public_key: String,
+    height: u64,
+    block_digest: String,
+    state_root: String,
+    finalized_blocks: u64,
+    mempool_len: usize,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    let config_file = std::fs::read_to_string(&args.config).expect("could not read config file");
+    let config: Config = serde_yaml::from_str(&config_file).expect("could not parse config file");
+    let key = from_hex(&config.private_key).expect("could not parse private key");
+    let signer = PrivateKey::decode(key.as_ref()).expect("private key is invalid");
+    let public_key = signer.public_key();
+
+    let runtime_cfg = cw_tokio::Config::default()
+        .with_tcp_nodelay(Some(true))
+        .with_worker_threads(config.worker_threads)
+        .with_max_blocking_threads(config.blocking_threads)
+        .with_storage_directory(PathBuf::from(&config.directory))
+        .with_catch_panics(false);
+    let executor = cw_tokio::Runner::new(runtime_cfg);
+
+    executor.start(|context| async move {
+        let log_level = Level::from_str(&config.log_level).expect("invalid log level");
+        cw_tokio::telemetry::init(
+            context.child("telemetry"),
+            cw_tokio::telemetry::Logging {
+                level: log_level,
+                json: false,
+            },
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                config.metrics_port,
+            )),
+            None,
+        );
+
+        let peers_file = std::fs::read_to_string(&args.peers).expect("could not read peers file");
+        let peers: Peers = serde_yaml::from_str(&peers_file).expect("could not parse peers file");
+        let peers: HashMap<PublicKey, SocketAddr> = peers
+            .addresses
+            .into_iter()
+            .map(|(peer, socket)| {
+                let key = from_hex(&peer).expect("could not parse peer public key");
+                let key = PublicKey::decode(key.as_ref()).expect("peer public key is invalid");
+                (key, socket)
+            })
+            .collect();
+        let peer_keys = peers.keys().cloned().collect::<Vec<_>>();
+        let mut bootstrappers = Vec::new();
+        for bootstrapper in &config.bootstrappers {
+            let key = from_hex(bootstrapper).expect("could not parse bootstrapper key");
+            let key = PublicKey::decode(key.as_ref()).expect("bootstrapper key is invalid");
+            let socket = peers
+                .get(&key)
+                .expect("bootstrapper not present in peers file");
+            bootstrappers.push((key, Ingress::Socket(*socket)));
+        }
+        let ip = peers
+            .get(&public_key)
+            .expect("self public key not present in peers file")
+            .ip();
+        info!(peers = peer_keys.len(), ?ip, "loaded peers");
+
+        let share = from_hex(&config.share).expect("could not parse share");
+        let share = group::Share::decode(share.as_ref()).expect("share is invalid");
+        let polynomial = from_hex(&config.polynomial).expect("could not parse polynomial");
+        let polynomial = Sharing::<MinSig>::decode_cfg(
+            polynomial.as_ref(),
+            &(NZU32!(peer_keys.len() as u32), ModeVersion::v0()),
+        )
+        .expect("polynomial is invalid");
+
+        let p2p_namespace = union_unique(NAMESPACE, b"_P2P");
+        let mut p2p_cfg = if config.local {
+            authenticated::Config::local(
+                signer.clone(),
+                &p2p_namespace,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port),
+                SocketAddr::new(ip, config.port),
+                bootstrappers,
+                MAX_MESSAGE_SIZE,
+            )
+        } else {
+            authenticated::Config::recommended(
+                signer.clone(),
+                &p2p_namespace,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port),
+                SocketAddr::new(ip, config.port),
+                bootstrappers,
+                MAX_MESSAGE_SIZE,
+            )
+        };
+        p2p_cfg.mailbox_size = NZUsize!(config.mailbox_size);
+
+        let (mut network, mut oracle) =
+            authenticated::Network::new(context.child("network"), p2p_cfg);
+        let participants: Set<PublicKey> = Set::from_iter_dedup(peer_keys.clone());
+        oracle.track(EPOCH.get(), participants.clone());
+
+        let message_quota = Quota::per_second(NonZeroU32::new(MESSAGE_RATE_PER_PEER).unwrap());
+        let pending = network.register(PENDING_CHANNEL, message_quota, config.message_backlog);
+        let recovered = network.register(RECOVERED_CHANNEL, message_quota, config.message_backlog);
+        let resolver = network.register(RESOLVER_CHANNEL, message_quota, config.message_backlog);
+        let broadcaster = network.register(
+            BROADCASTER_CHANNEL,
+            Quota::per_second(NonZeroU32::new(BROADCAST_RATE_PER_PEER).unwrap()),
+            config.message_backlog,
+        );
+        let marshal = network.register(
+            MARSHAL_CHANNEL,
+            Quota::per_second(NonZeroU32::new(MARSHAL_RATE_PER_PEER).unwrap()),
+            config.message_backlog,
+        );
+        let p2p = network.start();
+
+        let strategy = context
+            .create_strategy(NZUsize!(config.signature_threads))
+            .unwrap();
+        let mempool = Mempool::default();
+        let chain_state = SharedState::default();
+
+        let engine_cfg = engine::Config {
+            blocker: oracle.clone(),
+            provider: oracle.clone(),
+            partition_prefix: "coinschain".to_string(),
+            blocks_freezer_table_initial_size: BLOCKS_FREEZER_TABLE_INITIAL_SIZE,
+            finalized_freezer_table_initial_size: FINALIZED_FREEZER_TABLE_INITIAL_SIZE,
+            me: public_key.clone(),
+            participants,
+            mailbox_size: config.mailbox_size,
+            deque_size: config.deque_size,
+            leader_timeout: LEADER_TIMEOUT,
+            certification_timeout: CERTIFICATION_TIMEOUT,
+            nullify_retry: NULLIFY_RETRY,
+            activity_timeout: ACTIVITY_TIMEOUT,
+            skip_timeout: SKIP_TIMEOUT,
+            fetch_timeout: FETCH_TIMEOUT,
+            fetch_concurrent: FETCH_CONCURRENT,
+            fetch_rate_per_peer: message_quota,
+            polynomial,
+            share,
+            strategy,
+            mempool: mempool.clone(),
+            state: chain_state.clone(),
+        };
+        let engine = engine::Engine::new(context.child("engine"), engine_cfg).await;
+
+        let marshal_resolver_cfg = marshal::resolver::p2p::Config {
+            public_key: public_key.clone(),
+            peer_provider: oracle.clone(),
+            blocker: oracle,
+            mailbox_size: NZUsize!(config.mailbox_size),
+            initial: Duration::from_secs(1),
+            timeout: Duration::from_secs(2),
+            fetch_retry_timeout: Duration::from_millis(100),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let marshal_resolver = marshal::resolver::p2p::init(
+            context.child("marshal_resolver"),
+            marshal_resolver_cfg,
+            marshal,
+        );
+
+        let engine = engine.start(pending, recovered, resolver, broadcaster, marshal_resolver);
+        let rpc = spawn_rpc(
+            context.child("rpc"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.rpc_port),
+            RpcState {
+                public_key,
+                mempool,
+                chain: chain_state,
+            },
+        );
+
+        if let Err(e) = try_join_all(vec![p2p, engine, rpc]).await {
+            error!(?e, "coinschain validator task failed");
+        }
+    });
+}
+
+fn spawn_rpc(
+    context: impl commonware_runtime::Spawner,
+    bind: SocketAddr,
+    state: RpcState,
+) -> commonware_runtime::Handle<()> {
+    context.spawn(move |_| async move {
+        let app = Router::new()
+            .route("/status", get(status))
+            .route("/tx", post(submit_transaction))
+            .layer(CorsLayer::permissive())
+            .with_state(state);
+        let listener = TcpListener::bind(bind)
+            .await
+            .expect("failed to bind coinschain RPC");
+        info!(%bind, "started coinschain RPC");
+        axum::serve(listener, app)
+            .await
+            .expect("coinschain RPC server failed");
+    })
+}
+
+async fn status(State(state): State<RpcState>) -> Json<StatusResponse> {
+    let chain = state.chain.status();
+    Json(StatusResponse {
+        public_key: state.public_key.to_string(),
+        height: chain.height,
+        block_digest: chain.block_digest,
+        state_root: chain.state_root,
+        finalized_blocks: chain.finalized_blocks,
+        mempool_len: state.mempool.len(),
+    })
+}
+
+async fn submit_transaction(
+    State(state): State<RpcState>,
+    Json(request): Json<SubmitTransaction>,
+) -> Result<Json<SubmitTransactionResponse>, impl IntoResponse> {
+    let bytes = from_hex(&request.transaction).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid transaction hex".to_string(),
+        )
+    })?;
+    let transaction = Transaction::decode(bytes.as_ref()).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid transaction encoding: {error}"),
+        )
+    })?;
+    if !transaction.verify() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "bad transaction signature".to_string(),
+        ));
+    }
+
+    let digest = transaction.digest().to_string();
+    state.mempool.push(transaction);
+    Ok(Json(SubmitTransactionResponse {
+        accepted: true,
+        digest,
+        mempool_len: state.mempool.len(),
+    }))
+}
