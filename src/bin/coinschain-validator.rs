@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -24,7 +24,7 @@ use commonware_utils::{ordered::Set, union_unique, NZUsize, NZU32};
 use futures::future::try_join_all;
 use governor::Quota;
 use nunchi_sdk::{
-    coins::Transaction,
+    coins::{AccountId, CoinId, Transaction},
     coinschain::{engine, Config, Mempool, Peers, SharedState, EPOCH, NAMESPACE},
 };
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,32 @@ struct StatusResponse {
     block_digest: String,
     state_root: String,
     finalized_blocks: u64,
+    token_factory_nonce: u64,
     mempool_len: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AccountResponse {
+    account: String,
+    nonce: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CoinResponse {
+    coin: String,
+    issuer: String,
+    symbol: String,
+    name: String,
+    decimals: u8,
+    total_supply: u128,
+    max_supply: Option<u128>,
+}
+
+#[derive(Debug, Serialize)]
+struct BalanceResponse {
+    account: String,
+    coin: String,
+    balance: u128,
 }
 
 fn main() {
@@ -283,6 +308,9 @@ fn spawn_rpc(
         let app = Router::new()
             .route("/status", get(status))
             .route("/tx", post(submit_transaction))
+            .route("/accounts/{account}", get(account))
+            .route("/coins/{coin}", get(coin))
+            .route("/coins/{coin}/balances/{account}", get(balance))
             .layer(CorsLayer::permissive())
             .with_state(state);
         let listener = TcpListener::bind(bind)
@@ -297,12 +325,14 @@ fn spawn_rpc(
 
 async fn status(State(state): State<RpcState>) -> Json<StatusResponse> {
     let chain = state.chain.status();
+    let ledger = state.chain.finalized_ledger();
     Json(StatusResponse {
         public_key: state.public_key.to_string(),
         height: chain.height,
         block_digest: chain.block_digest,
         state_root: chain.state_root,
         finalized_blocks: chain.finalized_blocks,
+        token_factory_nonce: ledger.factory().next_nonce(),
         mempool_len: state.mempool.len(),
     })
 }
@@ -337,4 +367,67 @@ async fn submit_transaction(
         digest,
         mempool_len: state.mempool.len(),
     }))
+}
+
+async fn account(
+    State(state): State<RpcState>,
+    Path(account): Path<String>,
+) -> Result<Json<AccountResponse>, (StatusCode, String)> {
+    let account = parse_account(&account)?;
+    let ledger = state.chain.finalized_ledger();
+    Ok(Json(AccountResponse {
+        account: account.to_string(),
+        nonce: ledger.nonce(&account),
+    }))
+}
+
+async fn coin(
+    State(state): State<RpcState>,
+    Path(coin): Path<String>,
+) -> Result<Json<CoinResponse>, (StatusCode, String)> {
+    let coin = parse_coin(&coin)?;
+    let ledger = state.chain.finalized_ledger();
+    let token = ledger.token(&coin).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("unknown coin {}", coin.digest()),
+        )
+    })?;
+    Ok(Json(CoinResponse {
+        coin: coin.digest().to_string(),
+        issuer: token.issuer.to_string(),
+        symbol: token.symbol.clone(),
+        name: token.name.clone(),
+        decimals: token.decimals,
+        total_supply: token.total_supply,
+        max_supply: token.max_supply,
+    }))
+}
+
+async fn balance(
+    State(state): State<RpcState>,
+    Path((coin, account)): Path<(String, String)>,
+) -> Result<Json<BalanceResponse>, (StatusCode, String)> {
+    let coin = parse_coin(&coin)?;
+    let account = parse_account(&account)?;
+    let ledger = state.chain.finalized_ledger();
+    Ok(Json(BalanceResponse {
+        account: account.to_string(),
+        coin: coin.digest().to_string(),
+        balance: ledger.balance(&account, &coin),
+    }))
+}
+
+fn parse_account(encoded: &str) -> Result<AccountId, (StatusCode, String)> {
+    let bytes = from_hex(encoded)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid account hex".to_string()))?;
+    AccountId::decode(bytes.as_ref())
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid account: {error}")))
+}
+
+fn parse_coin(encoded: &str) -> Result<CoinId, (StatusCode, String)> {
+    let bytes = from_hex(encoded)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid coin hex".to_string()))?;
+    CoinId::decode(bytes.as_ref())
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("invalid coin: {error}")))
 }

@@ -49,6 +49,16 @@ impl SharedState {
             .clone()
     }
 
+    pub fn finalized_ledger(&self) -> Ledger {
+        let inner = self.inner.lock().expect("chain state lock poisoned");
+        let digest = inner.finalized.digest();
+        inner
+            .ledgers
+            .get(&digest)
+            .cloned()
+            .expect("finalized block ledger missing")
+    }
+
     pub fn ledger_for(&self, digest: &Digest) -> Option<Ledger> {
         self.inner
             .lock()

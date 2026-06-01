@@ -92,7 +92,7 @@ where
         let parent = ancestry.next().await?;
         let mut ledger = self.ledger_for_parent(parent.clone(), ancestry).await?;
 
-        let candidates = self.mempool.drain(MAX_BLOCK_TRANSACTIONS);
+        let candidates = self.mempool.snapshot(MAX_BLOCK_TRANSACTIONS);
         let mut included = Vec::with_capacity(candidates.len());
         for transaction in candidates {
             match ledger.apply_transaction(&transaction) {
@@ -168,13 +168,27 @@ impl Reporter for Application {
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let Update::Block(block, ack_rx) = activity {
+            let digest = block.digest();
+            let transactions = block.transactions.clone();
             info!(
                 height = %block.height,
-                digest = %block.digest(),
+                digest = %digest,
                 transactions = block.transactions.len(),
                 "finalized coinschain block"
             );
             self.state.finalize(block);
+            if let Some(ledger) = self.state.ledger_for(&digest) {
+                let removed = self
+                    .mempool
+                    .remove_finalized_and_invalid(&transactions, &ledger);
+                if removed > 0 {
+                    debug!(
+                        removed,
+                        remaining = self.mempool.len(),
+                        "pruned coinschain mempool"
+                    );
+                }
+            }
             ack_rx.acknowledge();
         }
         Feedback::Ok
