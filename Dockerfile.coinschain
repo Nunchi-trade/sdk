@@ -1,0 +1,11 @@
+FROM rust:1-bookworm AS builder
+WORKDIR /sdk
+COPY . .
+RUN cargo build --release --bin coinschain-validator
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /sdk/target/release/coinschain-validator /usr/local/bin/coinschain-validator
+ENTRYPOINT ["coinschain-validator"]
