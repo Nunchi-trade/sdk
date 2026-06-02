@@ -4,14 +4,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+URLS_DEFAULT="${URLS:-${URL:-http://127.0.0.1:18545,http://127.0.0.1:18546,http://127.0.0.1:18547,http://127.0.0.1:18548}}"
+
 ARGS=(
-  --url "${URL:-http://127.0.0.1:18545}"
-  --transactions "${TRANSACTIONS:-1000}"
-  --accounts "${ACCOUNTS:-16}"
-  --tokens "${TOKENS:-4}"
-  --issuers "${ISSUERS:-2}"
-  --max-transfer-amount "${MAX_TRANSFER_AMOUNT:-5}"
-  --timeout-secs "${TIMEOUT_SECS:-60}"
+  --url "$URLS_DEFAULT"
+  --transactions "${TRANSACTIONS:-10000000}"
+  --accounts "${ACCOUNTS:-16000}"
+  --tokens "${TOKENS:-4000}"
+  --issuers "${ISSUERS:-2000}"
+  --max-transfer-amount "${MAX_TRANSFER_AMOUNT:-500}"
+  --timeout-secs "${TIMEOUT_SECS:-600}"
 )
 
 if [[ -n "${ISSUER_SEED:-}" ]]; then

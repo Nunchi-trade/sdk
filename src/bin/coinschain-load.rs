@@ -2,6 +2,7 @@ use clap::Parser;
 use commonware_codec::Encode;
 use commonware_cryptography::Signer;
 use commonware_formatting::hex;
+use futures::future::join_all;
 use nunchi_sdk::coins::{
     AccountId, CoinId, CoinOperation, CoinSpec, PrivateKey, TokenFactory, Transaction,
 };
@@ -15,8 +16,12 @@ use std::{
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long, default_value = "http://127.0.0.1:18545")]
-    url: String,
+    #[arg(
+        long = "url",
+        value_delimiter = ',',
+        default_value = "http://127.0.0.1:18545"
+    )]
+    urls: Vec<String>,
     #[arg(long, default_value_t = 1000)]
     transactions: u64,
     #[arg(long, default_value_t = 16)]
@@ -27,10 +32,37 @@ struct Args {
     issuers: u64,
     #[arg(long, default_value_t = 5)]
     max_transfer_amount: u128,
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 600)]
     timeout_secs: u64,
     #[arg(long)]
     issuer_seed: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RpcEndpoints {
+    bases: Vec<String>,
+}
+
+impl RpcEndpoints {
+    fn new(urls: Vec<String>) -> Self {
+        let mut bases = Vec::new();
+        for url in urls {
+            let base = url.trim().trim_end_matches('/');
+            if !base.is_empty()
+                && !bases
+                    .iter()
+                    .any(|existing: &String| existing.as_str() == base)
+            {
+                bases.push(base.to_string());
+            }
+        }
+        assert!(!bases.is_empty(), "at least one --url must be provided");
+        Self { bases }
+    }
+
+    fn len(&self) -> usize {
+        self.bases.len()
+    }
 }
 
 #[derive(Clone)]
@@ -90,7 +122,7 @@ async fn main() {
     );
 
     let client = Client::new();
-    let base = args.url.trim_end_matches('/').to_string();
+    let endpoints = RpcEndpoints::new(args.urls);
     let issuer_seed = args.issuer_seed.unwrap_or_else(default_issuer_seed);
     let issuers = (0..args.issuers)
         .map(|index| PrivateKey::from_seed(issuer_seed.wrapping_add(index)))
@@ -104,7 +136,7 @@ async fn main() {
         .map(|key| key.public_key())
         .collect::<Vec<_>>();
 
-    let start_status = status(&client, &base).await;
+    let (read_base, start_status) = status(&client, &endpoints).await;
     let initial_supply = u128::from(args.transactions)
         .checked_mul(args.max_transfer_amount)
         .and_then(|supply| supply.checked_add(args.max_transfer_amount))
@@ -135,7 +167,7 @@ async fn main() {
 
     let mut issuer_nonces = Vec::with_capacity(issuer_ids.len());
     for issuer_id in &issuer_ids {
-        issuer_nonces.push(account(&client, &base, issuer_id).await.nonce);
+        issuer_nonces.push(account(&client, &read_base, issuer_id).await.nonce);
     }
     for token in &token_plans {
         let issuer = &issuers[token.issuer_index];
@@ -143,7 +175,7 @@ async fn main() {
         issuer_nonces[token.issuer_index] += 1;
         submit(
             &client,
-            &base,
+            &endpoints,
             &Transaction::sign(
                 issuer,
                 nonce,
@@ -156,7 +188,7 @@ async fn main() {
     }
     let batch_start = wait_for_created_tokens(
         &client,
-        &base,
+        &endpoints,
         &token_plans,
         &issuer_ids,
         &issuer_nonces,
@@ -190,7 +222,7 @@ async fn main() {
 
         submit(
             &client,
-            &base,
+            &endpoints,
             &Transaction::sign(
                 issuer,
                 nonce,
@@ -207,7 +239,7 @@ async fn main() {
 
     let final_status = wait_for_transfer_state(
         &client,
-        &base,
+        &endpoints,
         &token_plans,
         &issuer_ids,
         &issuer_nonces,
@@ -225,8 +257,9 @@ async fn main() {
 
     let tps = args.transactions as f64 / elapsed.as_secs_f64();
     println!(
-        "issuer_seed={} tokens={} issuers={} accounts={} submitted_transfers={} elapsed_ms={} submit_to_verified_tps={:.2} start_height={} final_height={} verified_balances={} start_state_root={} final_state_root={}",
+        "issuer_seed={} submit_endpoints={} tokens={} issuers={} accounts={} submitted_transfers={} elapsed_ms={} submit_to_verified_tps={:.2} start_height={} final_height={} verified_balances={} start_state_root={} final_state_root={}",
         issuer_seed,
+        endpoints.len(),
         args.tokens,
         args.issuers,
         args.accounts,
@@ -248,39 +281,67 @@ fn default_issuer_seed() -> u64 {
     now.as_secs() ^ u64::from(now.subsec_nanos()).rotate_left(32)
 }
 
-async fn submit(client: &Client, base: &str, transaction: &Transaction) {
+async fn submit(client: &Client, endpoints: &RpcEndpoints, transaction: &Transaction) {
     let encoded = hex(&transaction.encode());
+    let results = join_all(
+        endpoints
+            .bases
+            .iter()
+            .map(|base| submit_encoded(client, base, &encoded)),
+    )
+    .await;
+    if results.iter().all(Result::is_ok) {
+        return;
+    }
+
+    let errors = results
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>()
+        .join("; ");
+    panic!("transaction was not accepted by all endpoints: {errors}");
+}
+
+async fn submit_encoded(client: &Client, base: &str, encoded: &str) -> Result<(), String> {
     let response = client
         .post(format!("{base}/tx"))
         .json(&SubmitTransaction {
-            transaction: &encoded,
+            transaction: encoded,
         })
         .send()
         .await
-        .expect("failed to submit transaction");
+        .map_err(|error| format!("{base}: failed to submit transaction: {error}"))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        panic!("transaction rejected: {status} {body}");
+        return Err(format!("{base}: transaction rejected: {status} {body}"));
     }
     let accepted: SubmitTransactionResponse = response
         .json()
         .await
-        .expect("failed to decode submit response");
-    assert!(accepted.accepted);
+        .map_err(|error| format!("{base}: failed to decode submit response: {error}"))?;
+    if !accepted.accepted {
+        return Err(format!("{base}: transaction was not accepted"));
+    }
+    Ok(())
 }
 
-async fn status(client: &Client, base: &str) -> StatusResponse {
-    client
-        .get(format!("{base}/status"))
-        .send()
-        .await
-        .expect("failed to fetch status")
-        .error_for_status()
-        .expect("status endpoint returned error")
-        .json()
-        .await
-        .expect("failed to decode status")
+async fn status(client: &Client, endpoints: &RpcEndpoints) -> (String, StatusResponse) {
+    let mut errors = Vec::new();
+    for base in &endpoints.bases {
+        match try_status(client, base).await {
+            Ok(status) => return (base.clone(), status),
+            Err(error) => errors.push(error),
+        }
+    }
+    panic!(
+        "failed to fetch status from all endpoints: {}",
+        errors.join("; ")
+    );
+}
+
+async fn try_status(client: &Client, base: &str) -> Result<StatusResponse, String> {
+    get_json(client, format!("{base}/status")).await
 }
 
 async fn account(client: &Client, base: &str, account: &AccountId) -> AccountResponse {
@@ -333,7 +394,7 @@ async fn get_json<T: DeserializeOwned>(client: &Client, url: String) -> Result<T
 
 async fn wait_for_created_tokens(
     client: &Client,
-    base: &str,
+    endpoints: &RpcEndpoints,
     token_plans: &[TokenPlan],
     issuer_ids: &[AccountId],
     issuer_nonces: &[u64],
@@ -342,9 +403,9 @@ async fn wait_for_created_tokens(
 ) -> StatusResponse {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        let status = status(client, base).await;
+        let (base, status) = status(client, endpoints).await;
         let error = if status.height > min_height {
-            match verify_created_tokens(client, base, token_plans, issuer_ids, issuer_nonces).await
+            match verify_created_tokens(client, &base, token_plans, issuer_ids, issuer_nonces).await
             {
                 Ok(()) => return status,
                 Err(error) => error,
@@ -367,7 +428,7 @@ async fn wait_for_created_tokens(
 
 async fn wait_for_transfer_state(
     client: &Client,
-    base: &str,
+    endpoints: &RpcEndpoints,
     token_plans: &[TokenPlan],
     issuer_ids: &[AccountId],
     issuer_nonces: &[u64],
@@ -378,11 +439,11 @@ async fn wait_for_transfer_state(
 ) -> StatusResponse {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
-        let status = status(client, base).await;
+        let (base, status) = status(client, endpoints).await;
         let error = if status.height > min_height {
             match verify_transfer_state(
                 client,
-                base,
+                &base,
                 token_plans,
                 issuer_ids,
                 issuer_nonces,

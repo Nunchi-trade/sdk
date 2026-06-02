@@ -74,6 +74,45 @@ impl Application {
 
         None
     }
+
+    fn ledger_for_finalized_block(&self, block: &Block, digest: &sha256::Digest) -> Option<Ledger> {
+        if let Some(ledger) = self.state.ledger_for(digest) {
+            return Some(ledger);
+        }
+
+        let Some(mut ledger) = self.state.ledger_for(&block.parent) else {
+            warn!(
+                height = %block.height,
+                digest = %digest,
+                parent = %block.parent,
+                "missing parent ledger for finalized coinschain block"
+            );
+            return None;
+        };
+
+        if !apply_block(&mut ledger, block) {
+            warn!(
+                height = %block.height,
+                digest = %digest,
+                "failed to reconstruct finalized coinschain ledger"
+            );
+            return None;
+        }
+        let state_root = ledger.state_root();
+        if state_root != block.state_root {
+            warn!(
+                height = %block.height,
+                digest = %digest,
+                expected = %block.state_root,
+                actual = %state_root,
+                "reconstructed finalized coinschain ledger has wrong state root"
+            );
+            return None;
+        }
+
+        self.state.insert_block_state(block, ledger.clone());
+        Some(ledger)
+    }
 }
 
 impl<E> ConsensusApplication<E> for Application
@@ -169,15 +208,24 @@ impl Reporter for Application {
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         if let Update::Block(block, ack_rx) = activity {
             let digest = block.digest();
+            let height = block.height.get();
             let transactions = block.transactions.clone();
             info!(
-                height = %block.height,
+                height,
                 digest = %digest,
                 transactions = block.transactions.len(),
                 "finalized coinschain block"
             );
-            self.state.finalize(block);
-            if let Some(ledger) = self.state.ledger_for(&digest) {
+            if let Some(ledger) = self.ledger_for_finalized_block(&block, &digest) {
+                if !self.state.finalize(block) {
+                    warn!(
+                        height,
+                        digest = %digest,
+                        "skipped stale or unavailable coinschain finalization"
+                    );
+                    ack_rx.acknowledge();
+                    return Feedback::Ok;
+                }
                 let removed = self
                     .mempool
                     .remove_finalized_and_invalid(&transactions, &ledger);
@@ -188,6 +236,12 @@ impl Reporter for Application {
                         "pruned coinschain mempool"
                     );
                 }
+            } else {
+                warn!(
+                    height,
+                    digest = %digest,
+                    "skipped coinschain finalization because block state is unavailable"
+                );
             }
             ack_rx.acknowledge();
         }

@@ -1,6 +1,8 @@
-use crate::coins::{Ledger, LedgerError, Transaction};
+use crate::coins::{
+    CoinOperation, Ledger, TokenFactory, Transaction, MAX_NAME_BYTES, MAX_SYMBOL_BYTES,
+};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -30,7 +32,7 @@ impl Mempool {
         let finalized = finalized
             .iter()
             .map(Transaction::digest)
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         let mut removed = 0;
         let mut inner = self.inner.lock().expect("mempool lock poisoned");
         inner.retain(|transaction| {
@@ -66,21 +68,36 @@ fn is_stale_or_permanently_invalid(transaction: &Transaction, ledger: &Ledger) -
         return false;
     }
 
-    let mut ledger = ledger.clone();
-    match ledger.apply_transaction(transaction) {
-        Ok(()) => false,
-        Err(LedgerError::BadSignature)
-        | Err(LedgerError::InvalidTokenSpec(_))
-        | Err(LedgerError::InvalidAmount)
-        | Err(LedgerError::DuplicateToken(_))
-        | Err(LedgerError::Unauthorized) => true,
-        Err(LedgerError::NonceMismatch { actual, .. }) => actual < expected,
-        Err(LedgerError::NonceOverflow)
-        | Err(LedgerError::UnknownToken(_))
-        | Err(LedgerError::InsufficientBalance { .. })
-        | Err(LedgerError::BalanceOverflow)
-        | Err(LedgerError::SupplyOverflow)
-        | Err(LedgerError::MaxSupplyExceeded { .. }) => false,
+    match &transaction.payload.operation {
+        CoinOperation::CreateToken { spec } => {
+            if spec.symbol.is_empty()
+                || spec.symbol.len() > MAX_SYMBOL_BYTES
+                || spec.name.is_empty()
+                || spec.name.len() > MAX_NAME_BYTES
+                || spec
+                    .max_supply
+                    .is_some_and(|max_supply| spec.initial_supply > max_supply)
+            {
+                return true;
+            }
+            let coin = TokenFactory::derive_coin_id(
+                &transaction.signer,
+                ledger.factory().next_nonce(),
+                spec,
+            );
+            ledger.token(&coin).is_some()
+        }
+        CoinOperation::Mint { coin, amount, .. } => {
+            if *amount == 0 {
+                return true;
+            }
+            ledger
+                .token(coin)
+                .is_some_and(|token| token.issuer != transaction.signer)
+        }
+        CoinOperation::Burn { from, amount, .. } | CoinOperation::Transfer { from, amount, .. } => {
+            *amount == 0 || from != &transaction.signer
+        }
     }
 }
 
