@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -23,7 +23,7 @@ use commonware_utils::{ordered::Set, union_unique, NZUsize, NZU32};
 use futures::future::try_join_all;
 use governor::Quota;
 use nunchi_sdk::{
-    coins::{AccountId, CoinId, Transaction},
+    coins::{AccountId, CoinId, Ledger, Transaction},
     coinschain::{engine, Config, Mempool, Peers, SharedState, EPOCH, NAMESPACE},
 };
 use serde::{Deserialize, Serialize};
@@ -52,13 +52,14 @@ const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const SKIP_TIMEOUT: ViewDelta = ViewDelta::new(32);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const FETCH_CONCURRENT: usize = 4;
-const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
-const MESSAGE_RATE_PER_PEER: u32 = 128;
-const BROADCAST_RATE_PER_PEER: u32 = 16;
-const MARSHAL_RATE_PER_PEER: u32 = 16;
+const MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
+const MESSAGE_RATE_PER_PEER: u32 = 512;
+const BROADCAST_RATE_PER_PEER: u32 = 128;
+const MARSHAL_RATE_PER_PEER: u32 = 128;
 const BLOCKS_FREEZER_TABLE_INITIAL_SIZE: u32 = 2u32.pow(18);
 const FINALIZED_FREEZER_TABLE_INITIAL_SIZE: u32 = 2u32.pow(18);
 const MAX_SUBMIT_BATCH: usize = 10_000;
+const MAX_READ_BATCH: usize = 100_000;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -133,6 +134,27 @@ struct BalanceResponse {
     account: String,
     coin: String,
     balance: u128,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountsRequest {
+    accounts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CoinsRequest {
+    coins: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceRequest {
+    account: String,
+    coin: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalancesRequest {
+    balances: Vec<BalanceRequest>,
 }
 
 fn main() {
@@ -322,9 +344,13 @@ fn spawn_rpc(
             .route("/status", get(status))
             .route("/tx", post(submit_transaction))
             .route("/txs", post(submit_transactions))
+            .route("/accounts", post(accounts))
             .route("/accounts/{account}", get(account))
+            .route("/coins", post(coins))
             .route("/coins/{coin}", get(coin))
+            .route("/balances", post(balances))
             .route("/coins/{coin}/balances/{account}", get(balance))
+            .layer(DefaultBodyLimit::max(MAX_MESSAGE_SIZE as usize))
             .layer(CorsLayer::permissive())
             .with_state(state);
         let listener = TcpListener::bind(bind)
@@ -357,7 +383,7 @@ async fn submit_transaction(
 ) -> Result<Json<SubmitTransactionResponse>, (StatusCode, String)> {
     let transaction = decode_transaction(&request.transaction)?;
     let digest = transaction.digest().to_string();
-    state.mempool.push(transaction);
+    state.mempool.push_verified(transaction);
     Ok(Json(SubmitTransactionResponse {
         accepted: true,
         digest,
@@ -394,7 +420,7 @@ async fn submit_transactions(
         transactions.push(transaction);
     }
     let accepted_count = transactions.len();
-    let mempool_len = state.mempool.extend(transactions);
+    let mempool_len = state.mempool.extend_verified(transactions);
     Ok(Json(SubmitTransactionsResponse {
         accepted: true,
         accepted_count,
@@ -425,6 +451,23 @@ fn decode_transaction(encoded: &str) -> Result<Transaction, (StatusCode, String)
     Ok(transaction)
 }
 
+async fn accounts(
+    State(state): State<RpcState>,
+    Json(request): Json<AccountsRequest>,
+) -> Result<Json<Vec<AccountResponse>>, (StatusCode, String)> {
+    ensure_read_batch("accounts", request.accounts.len())?;
+    let ledger = state.chain.finalized_ledger();
+    let mut responses = Vec::with_capacity(request.accounts.len());
+    for account in request.accounts {
+        let account = parse_account(&account)?;
+        responses.push(AccountResponse {
+            account: account.to_string(),
+            nonce: ledger.nonce(&account),
+        });
+    }
+    Ok(Json(responses))
+}
+
 async fn account(
     State(state): State<RpcState>,
     Path(account): Path<String>,
@@ -437,19 +480,52 @@ async fn account(
     }))
 }
 
+async fn coins(
+    State(state): State<RpcState>,
+    Json(request): Json<CoinsRequest>,
+) -> Result<Json<Vec<CoinResponse>>, (StatusCode, String)> {
+    ensure_read_batch("coins", request.coins.len())?;
+    let ledger = state.chain.finalized_ledger();
+    let mut responses = Vec::with_capacity(request.coins.len());
+    for coin in request.coins {
+        let coin = parse_coin(&coin)?;
+        responses.push(coin_response(&ledger, coin)?);
+    }
+    Ok(Json(responses))
+}
+
 async fn coin(
     State(state): State<RpcState>,
     Path(coin): Path<String>,
 ) -> Result<Json<CoinResponse>, (StatusCode, String)> {
     let coin = parse_coin(&coin)?;
     let ledger = state.chain.finalized_ledger();
+    Ok(Json(coin_response(&ledger, coin)?))
+}
+
+async fn balances(
+    State(state): State<RpcState>,
+    Json(request): Json<BalancesRequest>,
+) -> Result<Json<Vec<BalanceResponse>>, (StatusCode, String)> {
+    ensure_read_batch("balances", request.balances.len())?;
+    let ledger = state.chain.finalized_ledger();
+    let mut responses = Vec::with_capacity(request.balances.len());
+    for balance in request.balances {
+        let account = parse_account(&balance.account)?;
+        let coin = parse_coin(&balance.coin)?;
+        responses.push(balance_response(&ledger, coin, account));
+    }
+    Ok(Json(responses))
+}
+
+fn coin_response(ledger: &Ledger, coin: CoinId) -> Result<CoinResponse, (StatusCode, String)> {
     let token = ledger.token(&coin).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             format!("unknown coin {}", coin.digest()),
         )
     })?;
-    Ok(Json(CoinResponse {
+    Ok(CoinResponse {
         coin: coin.digest().to_string(),
         issuer: token.issuer.to_string(),
         symbol: token.symbol.clone(),
@@ -457,7 +533,7 @@ async fn coin(
         decimals: token.decimals,
         total_supply: token.total_supply,
         max_supply: token.max_supply,
-    }))
+    })
 }
 
 async fn balance(
@@ -467,11 +543,25 @@ async fn balance(
     let coin = parse_coin(&coin)?;
     let account = parse_account(&account)?;
     let ledger = state.chain.finalized_ledger();
-    Ok(Json(BalanceResponse {
+    Ok(Json(balance_response(&ledger, coin, account)))
+}
+
+fn balance_response(ledger: &Ledger, coin: CoinId, account: AccountId) -> BalanceResponse {
+    BalanceResponse {
         account: account.to_string(),
         coin: coin.digest().to_string(),
         balance: ledger.balance(&account, &coin),
-    }))
+    }
+}
+
+fn ensure_read_batch(kind: &str, len: usize) -> Result<(), (StatusCode, String)> {
+    if len > MAX_READ_BATCH {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("{kind} batch too large: max={MAX_READ_BATCH}, actual={len}"),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_account(encoded: &str) -> Result<AccountId, (StatusCode, String)> {

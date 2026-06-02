@@ -85,6 +85,10 @@ impl Ledger {
             return Err(LedgerError::BadSignature);
         }
 
+        self.apply_verified_transaction(tx)
+    }
+
+    pub fn apply_verified_transaction(&mut self, tx: &Transaction) -> Result<(), LedgerError> {
         let expected = self.nonce(&tx.signer);
         if tx.payload.nonce != expected {
             return Err(LedgerError::NonceMismatch {

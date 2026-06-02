@@ -16,6 +16,9 @@ ARGS=(
   --timeout-secs "${TIMEOUT_SECS:-600}"
   --batch-size "${BATCH_SIZE:-512}"
   --in-flight "${IN_FLIGHT:-16}"
+  --single-every "${SINGLE_EVERY:-0}"
+  --read-batch-size "${READ_BATCH_SIZE:-10000}"
+  --request-timeout-secs "${REQUEST_TIMEOUT_SECS:-30}"
   --progress-every "${PROGRESS_EVERY:-100000}"
 )
 
@@ -23,4 +26,10 @@ if [[ -n "${ISSUER_SEED:-}" ]]; then
   ARGS+=(--issuer-seed "$ISSUER_SEED")
 fi
 
-cargo run --bin coinschain-load -- "${ARGS[@]}"
+CARGO_ARGS=(run)
+if [[ "${RELEASE:-0}" == "1" ]]; then
+  CARGO_ARGS+=(--release)
+fi
+CARGO_ARGS+=(--bin coinschain-load --)
+
+cargo "${CARGO_ARGS[@]}" "${ARGS[@]}"

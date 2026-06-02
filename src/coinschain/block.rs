@@ -4,7 +4,8 @@ use commonware_codec::{Encode, EncodeSize, Error, RangeCfg, Read, ReadExt, Write
 use commonware_consensus::{types::Height, CertifiableBlock, Heightable};
 use commonware_cryptography::{sha256::Digest, Digestible, Hasher, Sha256};
 
-pub const MAX_BLOCK_TRANSACTIONS: usize = 10_000;
+pub const MAX_BLOCK_TRANSACTIONS: usize = 50_000;
+pub const MAX_BLOCK_BYTES: usize = 3 * 1024 * 1024;
 
 /// A coinschain block certified by threshold Simplex.
 #[derive(Clone, Debug, Eq, PartialEq)]

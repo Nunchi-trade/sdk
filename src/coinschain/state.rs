@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const LEDGER_RETENTION_DEPTH: u64 = 512;
+const LEDGER_RETENTION_DEPTH: u64 = 8;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ChainStatus {
