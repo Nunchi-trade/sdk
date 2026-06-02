@@ -131,7 +131,7 @@ where
         let parent = ancestry.next().await?;
         let mut ledger = self.ledger_for_parent(parent.clone(), ancestry).await?;
 
-        let candidates = self.mempool.snapshot(MAX_BLOCK_TRANSACTIONS);
+        let candidates = self.mempool.snapshot(&ledger, MAX_BLOCK_TRANSACTIONS);
         let mut included = Vec::with_capacity(candidates.len());
         for transaction in candidates {
             match ledger.apply_transaction(&transaction) {

@@ -1,27 +1,83 @@
 use crate::coins::{
-    CoinOperation, Ledger, TokenFactory, Transaction, MAX_NAME_BYTES, MAX_SYMBOL_BYTES,
+    AccountId, CoinOperation, Ledger, TokenFactory, Transaction, MAX_NAME_BYTES, MAX_SYMBOL_BYTES,
 };
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
 #[derive(Clone, Debug, Default)]
 pub struct Mempool {
-    inner: Arc<Mutex<VecDeque<Transaction>>>,
+    inner: Arc<Mutex<MempoolInner>>,
+}
+
+#[derive(Debug, Default)]
+struct MempoolInner {
+    signer_order: VecDeque<AccountId>,
+    pending: BTreeMap<AccountId, BTreeMap<u64, VecDeque<Transaction>>>,
+    len: usize,
 }
 
 impl Mempool {
     pub fn push(&self, transaction: Transaction) {
-        self.inner
-            .lock()
-            .expect("mempool lock poisoned")
-            .push_back(transaction);
+        self.extend([transaction]);
     }
 
-    pub fn snapshot(&self, max: usize) -> Vec<Transaction> {
+    pub fn extend(&self, transactions: impl IntoIterator<Item = Transaction>) -> usize {
+        let mut inner = self.inner.lock().expect("mempool lock poisoned");
+        for transaction in transactions {
+            inner.push(transaction);
+        }
+        inner.len
+    }
+
+    pub fn snapshot(&self, ledger: &Ledger, max: usize) -> Vec<Transaction> {
+        if max == 0 {
+            return Vec::new();
+        }
+
         let inner = self.inner.lock().expect("mempool lock poisoned");
-        inner.iter().take(max).cloned().collect()
+        let mut next_nonces = inner
+            .signer_order
+            .iter()
+            .map(|signer| (signer.clone(), ledger.nonce(signer)))
+            .collect::<BTreeMap<_, _>>();
+        let mut selected = Vec::with_capacity(max.min(inner.len));
+
+        loop {
+            let mut progressed = false;
+            for signer in &inner.signer_order {
+                if selected.len() == max {
+                    return selected;
+                }
+                let expected = next_nonces
+                    .get(signer)
+                    .copied()
+                    .unwrap_or_else(|| ledger.nonce(signer));
+                let Some(by_nonce) = inner.pending.get(signer) else {
+                    continue;
+                };
+                let Some(transactions) = by_nonce.get(&expected) else {
+                    continue;
+                };
+                if transactions.is_empty() {
+                    continue;
+                }
+
+                progressed = true;
+                for transaction in transactions {
+                    if selected.len() == max {
+                        return selected;
+                    }
+                    selected.push(transaction.clone());
+                }
+                next_nonces.insert(signer.clone(), expected.saturating_add(1));
+            }
+
+            if !progressed {
+                return selected;
+            }
+        }
     }
 
     pub fn remove_finalized_and_invalid(
@@ -35,23 +91,62 @@ impl Mempool {
             .collect::<BTreeSet<_>>();
         let mut removed = 0;
         let mut inner = self.inner.lock().expect("mempool lock poisoned");
-        inner.retain(|transaction| {
-            let remove = finalized.contains(&transaction.digest())
-                || is_stale_or_permanently_invalid(transaction, ledger);
-            if remove {
-                removed += 1;
+        let mut empty_signers = BTreeSet::new();
+        for (signer, by_nonce) in &mut inner.pending {
+            let mut empty_nonces = Vec::new();
+            for (nonce, transactions) in by_nonce.iter_mut() {
+                transactions.retain(|transaction| {
+                    let remove = finalized.contains(&transaction.digest())
+                        || is_stale_or_permanently_invalid(transaction, ledger);
+                    if remove {
+                        removed += 1;
+                    }
+                    !remove
+                });
+                if transactions.is_empty() {
+                    empty_nonces.push(*nonce);
+                }
             }
-            !remove
-        });
+            for nonce in empty_nonces {
+                by_nonce.remove(&nonce);
+            }
+            if by_nonce.is_empty() {
+                empty_signers.insert(signer.clone());
+            }
+        }
+        for signer in &empty_signers {
+            inner.pending.remove(signer);
+        }
+        inner
+            .signer_order
+            .retain(|signer| !empty_signers.contains(signer));
+        inner.len = inner.len.saturating_sub(removed);
         removed
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("mempool lock poisoned").len()
+        self.inner.lock().expect("mempool lock poisoned").len
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl MempoolInner {
+    fn push(&mut self, transaction: Transaction) {
+        let signer = transaction.signer.clone();
+        let nonce = transaction.payload.nonce;
+        if !self.pending.contains_key(&signer) {
+            self.signer_order.push_back(signer.clone());
+        }
+        self.pending
+            .entry(signer)
+            .or_default()
+            .entry(nonce)
+            .or_default()
+            .push_back(transaction);
+        self.len += 1;
     }
 }
 
@@ -128,9 +223,39 @@ mod tests {
         mempool.push(first.clone());
         mempool.push(second.clone());
 
-        assert_eq!(mempool.snapshot(1), vec![first.clone()]);
+        let ledger = Ledger::default();
+        assert_eq!(mempool.snapshot(&ledger, 1), vec![first.clone()]);
         assert_eq!(mempool.len(), 2);
-        assert_eq!(mempool.snapshot(10), vec![first, second]);
+        assert_eq!(mempool.snapshot(&ledger, 10), vec![first, second]);
+    }
+
+    #[test]
+    fn snapshot_orders_transactions_by_executable_nonce() {
+        let issuer = PrivateKey::from_seed(2);
+        let issuer_id = issuer.public_key();
+        let spec = CoinSpec::new("OOO", "Out Of Order Coin", 0, 10, Some(10));
+        let coin = TokenFactory::derive_coin_id(&issuer_id, 0, &spec);
+        let future = Transaction::sign(
+            &issuer,
+            1,
+            CoinOperation::Transfer {
+                coin,
+                from: issuer_id.clone(),
+                to: issuer_id.clone(),
+                amount: 1,
+            },
+        );
+        let current = Transaction::sign(
+            &issuer,
+            0,
+            CoinOperation::CreateToken { spec: spec.clone() },
+        );
+        let mempool = Mempool::default();
+        mempool.push(future.clone());
+        mempool.push(current.clone());
+
+        let ledger = Ledger::default();
+        assert_eq!(mempool.snapshot(&ledger, 10), vec![current, future]);
     }
 
     #[test]
@@ -198,6 +323,6 @@ mod tests {
         }
 
         assert_eq!(mempool.remove_finalized_and_invalid(&[create], &ledger), 3);
-        assert_eq!(mempool.snapshot(10), vec![valid_now, future_valid]);
+        assert_eq!(mempool.snapshot(&ledger, 10), vec![valid_now, future_valid]);
     }
 }

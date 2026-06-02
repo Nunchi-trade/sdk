@@ -14,6 +14,9 @@ ARGS=(
   --issuers "${ISSUERS:-2000}"
   --max-transfer-amount "${MAX_TRANSFER_AMOUNT:-500}"
   --timeout-secs "${TIMEOUT_SECS:-600}"
+  --batch-size "${BATCH_SIZE:-512}"
+  --in-flight "${IN_FLIGHT:-16}"
+  --progress-every "${PROGRESS_EVERY:-100000}"
 )
 
 if [[ -n "${ISSUER_SEED:-}" ]]; then

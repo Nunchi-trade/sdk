@@ -2,7 +2,10 @@ use clap::Parser;
 use commonware_codec::Encode;
 use commonware_cryptography::Signer;
 use commonware_formatting::hex;
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use nunchi_sdk::coins::{
     AccountId, CoinId, CoinOperation, CoinSpec, PrivateKey, TokenFactory, Transaction,
 };
@@ -34,6 +37,12 @@ struct Args {
     max_transfer_amount: u128,
     #[arg(long, default_value_t = 600)]
     timeout_secs: u64,
+    #[arg(long, default_value_t = 512)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 16)]
+    in_flight: usize,
+    #[arg(long, default_value_t = 100_000)]
+    progress_every: u64,
     #[arg(long)]
     issuer_seed: Option<u64>,
 }
@@ -74,13 +83,14 @@ struct TokenPlan {
 }
 
 #[derive(Debug, Serialize)]
-struct SubmitTransaction<'a> {
-    transaction: &'a str,
+struct SubmitTransactions<'a> {
+    transactions: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]
-struct SubmitTransactionResponse {
+struct SubmitTransactionsResponse {
     accepted: bool,
+    accepted_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -120,6 +130,8 @@ async fn main() {
         args.max_transfer_amount > 0,
         "max_transfer_amount must be greater than zero"
     );
+    assert!(args.batch_size > 0, "batch_size must be greater than zero");
+    assert!(args.in_flight > 0, "in_flight must be greater than zero");
 
     let client = Client::new();
     let endpoints = RpcEndpoints::new(args.urls);
@@ -169,23 +181,35 @@ async fn main() {
     for issuer_id in &issuer_ids {
         issuer_nonces.push(account(&client, &read_base, issuer_id).await.nonce);
     }
+    let mut create_transactions = Vec::with_capacity(token_plans.len());
     for token in &token_plans {
         let issuer = &issuers[token.issuer_index];
         let nonce = issuer_nonces[token.issuer_index];
         issuer_nonces[token.issuer_index] += 1;
-        submit(
-            &client,
-            &endpoints,
-            &Transaction::sign(
-                issuer,
-                nonce,
-                CoinOperation::CreateToken {
-                    spec: token.spec.clone(),
-                },
-            ),
-        )
-        .await;
+        create_transactions.push(Transaction::sign(
+            issuer,
+            nonce,
+            CoinOperation::CreateToken {
+                spec: token.spec.clone(),
+            },
+        ));
     }
+    let create_in_flight = 1;
+    submit_transaction_batches(
+        &client,
+        &endpoints,
+        create_transactions,
+        args.batch_size,
+        create_in_flight,
+    )
+    .await;
+    println!(
+        "submitted_token_creates={} batch_size={} in_flight={}",
+        token_plans.len(),
+        args.batch_size,
+        create_in_flight
+    );
+
     let batch_start = wait_for_created_tokens(
         &client,
         &endpoints,
@@ -204,6 +228,10 @@ async fn main() {
     let mut recipient_balances = BTreeMap::<(AccountId, CoinId), u128>::new();
 
     let started = Instant::now();
+    let mut pending = FuturesUnordered::new();
+    let mut batch = Vec::with_capacity(args.batch_size);
+    let mut dispatched = 0u64;
+    let mut next_progress = args.progress_every;
     for transfer_index in 0..args.transactions {
         let token = &token_plans[(transfer_index % args.tokens) as usize];
         let issuer = &issuers[token.issuer_index];
@@ -220,22 +248,52 @@ async fn main() {
             .entry((recipient.clone(), token.coin))
             .or_default() += amount;
 
-        submit(
-            &client,
-            &endpoints,
-            &Transaction::sign(
-                issuer,
-                nonce,
-                CoinOperation::Transfer {
-                    coin: token.coin,
-                    from: issuer_id.clone(),
-                    to: recipient,
-                    amount,
-                },
-            ),
-        )
-        .await;
+        batch.push(Transaction::sign(
+            issuer,
+            nonce,
+            CoinOperation::Transfer {
+                coin: token.coin,
+                from: issuer_id.clone(),
+                to: recipient,
+                amount,
+            },
+        ));
+
+        if batch.len() == args.batch_size {
+            while pending.len() >= args.in_flight {
+                pending.next().await.expect("pending batch missing");
+            }
+            dispatched += batch.len() as u64;
+            pending.push(submit_batch(
+                client.clone(),
+                endpoints.clone(),
+                std::mem::take(&mut batch),
+            ));
+            batch = Vec::with_capacity(args.batch_size);
+            if args.progress_every > 0 && dispatched >= next_progress {
+                println!(
+                    "submitted_transfers={} elapsed_ms={} pending_batches={}",
+                    dispatched,
+                    started.elapsed().as_millis(),
+                    pending.len()
+                );
+                next_progress = next_progress.saturating_add(args.progress_every);
+            }
+        }
     }
+    if !batch.is_empty() {
+        while pending.len() >= args.in_flight {
+            pending.next().await.expect("pending batch missing");
+        }
+        dispatched += batch.len() as u64;
+        pending.push(submit_batch(client.clone(), endpoints.clone(), batch));
+    }
+    while pending.next().await.is_some() {}
+    println!(
+        "submitted_transfer_dispatch_complete={} elapsed_ms={}",
+        dispatched,
+        started.elapsed().as_millis()
+    );
 
     let final_status = wait_for_transfer_state(
         &client,
@@ -257,9 +315,11 @@ async fn main() {
 
     let tps = args.transactions as f64 / elapsed.as_secs_f64();
     println!(
-        "issuer_seed={} submit_endpoints={} tokens={} issuers={} accounts={} submitted_transfers={} elapsed_ms={} submit_to_verified_tps={:.2} start_height={} final_height={} verified_balances={} start_state_root={} final_state_root={}",
+        "issuer_seed={} submit_endpoints={} batch_size={} in_flight={} tokens={} issuers={} accounts={} submitted_transfers={} elapsed_ms={} submit_to_verified_tps={:.2} start_height={} final_height={} verified_balances={} start_state_root={} final_state_root={}",
         issuer_seed,
         endpoints.len(),
+        args.batch_size,
+        args.in_flight,
         args.tokens,
         args.issuers,
         args.accounts,
@@ -281,13 +341,41 @@ fn default_issuer_seed() -> u64 {
     now.as_secs() ^ u64::from(now.subsec_nanos()).rotate_left(32)
 }
 
-async fn submit(client: &Client, endpoints: &RpcEndpoints, transaction: &Transaction) {
-    let encoded = hex(&transaction.encode());
+async fn submit_transaction_batches(
+    client: &Client,
+    endpoints: &RpcEndpoints,
+    transactions: Vec<Transaction>,
+    batch_size: usize,
+    in_flight: usize,
+) {
+    let mut pending = FuturesUnordered::new();
+    for batch in transactions.chunks(batch_size) {
+        while pending.len() >= in_flight {
+            pending.next().await.expect("pending batch missing");
+        }
+        pending.push(submit_batch(
+            client.clone(),
+            endpoints.clone(),
+            batch.to_vec(),
+        ));
+    }
+    while pending.next().await.is_some() {}
+}
+
+async fn submit_batch(client: Client, endpoints: RpcEndpoints, transactions: Vec<Transaction>) {
+    if transactions.is_empty() {
+        return;
+    }
+
+    let encoded = transactions
+        .iter()
+        .map(|transaction| hex(&transaction.encode()))
+        .collect::<Vec<_>>();
     let results = join_all(
         endpoints
             .bases
             .iter()
-            .map(|base| submit_encoded(client, base, &encoded)),
+            .map(|base| submit_encoded_batch(&client, base, &encoded)),
     )
     .await;
     if results.iter().all(Result::is_ok) {
@@ -299,29 +387,39 @@ async fn submit(client: &Client, endpoints: &RpcEndpoints, transaction: &Transac
         .filter_map(Result::err)
         .collect::<Vec<_>>()
         .join("; ");
-    panic!("transaction was not accepted by all endpoints: {errors}");
+    panic!("transaction batch was not accepted by all endpoints: {errors}");
 }
 
-async fn submit_encoded(client: &Client, base: &str, encoded: &str) -> Result<(), String> {
+async fn submit_encoded_batch(
+    client: &Client,
+    base: &str,
+    encoded: &[String],
+) -> Result<(), String> {
     let response = client
-        .post(format!("{base}/tx"))
-        .json(&SubmitTransaction {
-            transaction: encoded,
+        .post(format!("{base}/txs"))
+        .json(&SubmitTransactions {
+            transactions: encoded,
         })
         .send()
         .await
-        .map_err(|error| format!("{base}: failed to submit transaction: {error}"))?;
+        .map_err(|error| format!("{base}: failed to submit transaction batch: {error}"))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("{base}: transaction rejected: {status} {body}"));
+        return Err(format!(
+            "{base}: transaction batch rejected: {status} {body}"
+        ));
     }
-    let accepted: SubmitTransactionResponse = response
+    let accepted: SubmitTransactionsResponse = response
         .json()
         .await
-        .map_err(|error| format!("{base}: failed to decode submit response: {error}"))?;
-    if !accepted.accepted {
-        return Err(format!("{base}: transaction was not accepted"));
+        .map_err(|error| format!("{base}: failed to decode submit batch response: {error}"))?;
+    if !accepted.accepted || accepted.accepted_count != encoded.len() {
+        return Err(format!(
+            "{base}: transaction batch accepted_count mismatch: actual={} expected={}",
+            accepted.accepted_count,
+            encoded.len()
+        ));
     }
     Ok(())
 }

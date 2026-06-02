@@ -1,7 +1,6 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -53,12 +52,13 @@ const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const SKIP_TIMEOUT: ViewDelta = ViewDelta::new(32);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const FETCH_CONCURRENT: usize = 4;
-const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+const MAX_MESSAGE_SIZE: u32 = 8 * 1024 * 1024;
 const MESSAGE_RATE_PER_PEER: u32 = 128;
 const BROADCAST_RATE_PER_PEER: u32 = 16;
 const MARSHAL_RATE_PER_PEER: u32 = 16;
 const BLOCKS_FREEZER_TABLE_INITIAL_SIZE: u32 = 2u32.pow(18);
 const FINALIZED_FREEZER_TABLE_INITIAL_SIZE: u32 = 2u32.pow(18);
+const MAX_SUBMIT_BATCH: usize = 10_000;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -80,10 +80,23 @@ struct SubmitTransaction {
     transaction: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SubmitTransactions {
+    transactions: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct SubmitTransactionResponse {
     accepted: bool,
     digest: String,
+    mempool_len: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitTransactionsResponse {
+    accepted: bool,
+    accepted_count: usize,
+    digests: Vec<String>,
     mempool_len: usize,
 }
 
@@ -308,6 +321,7 @@ fn spawn_rpc(
         let app = Router::new()
             .route("/status", get(status))
             .route("/tx", post(submit_transaction))
+            .route("/txs", post(submit_transactions))
             .route("/accounts/{account}", get(account))
             .route("/coins/{coin}", get(coin))
             .route("/coins/{coin}/balances/{account}", get(balance))
@@ -340,8 +354,57 @@ async fn status(State(state): State<RpcState>) -> Json<StatusResponse> {
 async fn submit_transaction(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransaction>,
-) -> Result<Json<SubmitTransactionResponse>, impl IntoResponse> {
-    let bytes = from_hex(&request.transaction).ok_or_else(|| {
+) -> Result<Json<SubmitTransactionResponse>, (StatusCode, String)> {
+    let transaction = decode_transaction(&request.transaction)?;
+    let digest = transaction.digest().to_string();
+    state.mempool.push(transaction);
+    Ok(Json(SubmitTransactionResponse {
+        accepted: true,
+        digest,
+        mempool_len: state.mempool.len(),
+    }))
+}
+
+async fn submit_transactions(
+    State(state): State<RpcState>,
+    Json(request): Json<SubmitTransactions>,
+) -> Result<Json<SubmitTransactionsResponse>, (StatusCode, String)> {
+    if request.transactions.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "empty transaction batch".to_string(),
+        ));
+    }
+    if request.transactions.len() > MAX_SUBMIT_BATCH {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "transaction batch too large: max={}, actual={}",
+                MAX_SUBMIT_BATCH,
+                request.transactions.len()
+            ),
+        ));
+    }
+
+    let mut transactions = Vec::with_capacity(request.transactions.len());
+    let mut digests = Vec::with_capacity(request.transactions.len());
+    for encoded in &request.transactions {
+        let transaction = decode_transaction(encoded)?;
+        digests.push(transaction.digest().to_string());
+        transactions.push(transaction);
+    }
+    let accepted_count = transactions.len();
+    let mempool_len = state.mempool.extend(transactions);
+    Ok(Json(SubmitTransactionsResponse {
+        accepted: true,
+        accepted_count,
+        digests,
+        mempool_len,
+    }))
+}
+
+fn decode_transaction(encoded: &str) -> Result<Transaction, (StatusCode, String)> {
+    let bytes = from_hex(encoded).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             "invalid transaction hex".to_string(),
@@ -359,14 +422,7 @@ async fn submit_transaction(
             "bad transaction signature".to_string(),
         ));
     }
-
-    let digest = transaction.digest().to_string();
-    state.mempool.push(transaction);
-    Ok(Json(SubmitTransactionResponse {
-        accepted: true,
-        digest,
-        mempool_len: state.mempool.len(),
-    }))
+    Ok(transaction)
 }
 
 async fn account(
